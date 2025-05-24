@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import argparse
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from datetime import datetime
 import re
+from typing import List, Tuple # Import List and Tuple for type hinting
 
 class KGMLtoSBMLConverter:
     """Converts KGML (KEGG Markup Language) files to SBML format."""
@@ -257,33 +261,61 @@ class KGMLtoSBMLConverter:
         # If multiple distinct KEGG IDs are present (e.g. for a gene entry `name="hsa:X ko:Y"`), `isVersionOf` might be better.
         # If it's just one ID (e.g. a compound or a reaction), `is` is fine.
         qualifier_tag = "bqbiol:is"
-        if len(kegg_id_tuples) > 1 and any(t[0] != kegg_id_tuples[0][0] for t in kegg_id_tuples):
-             qualifier_tag = "bqbiol:isDescribedBy" # Generic for mixed types, or handle types better
+        # A more robust check for multiple distinct types or a complex entity
+        is_complex_entity = False
+        if len(kegg_id_tuples) > 1:
+            first_type = kegg_id_tuples[0][0]
+            # Check if there are other types or if any ID represents a collection (like 'genes' for multiple gene products)
+            if any(t[0] != first_type for t in kegg_id_tuples) or \
+               any(t[0] in ["genes", "orthology"] and " " in t[1] for t in kegg_id_tuples): # Simplistic check for multiple items in one ID string
+                is_complex_entity = True
         
-        is_version_of = ET.SubElement(description, qualifier_tag) # Changed to isVersionOf for broader applicability
-        bag = ET.SubElement(is_version_of, "rdf:Bag")
+        if is_complex_entity:
+            qualifier_tag = "bqbiol:isDescribedBy" # Using for more complex cases like gene groups
+
+        
+        bq_element = ET.SubElement(description, qualifier_tag)
+        bag = ET.SubElement(bq_element, "rdf:Bag")
 
         for kegg_db_prefix, full_kegg_id in kegg_id_tuples:
             # kegg_db_prefix like "compound", "reaction", "genes", "orthology"
             # full_kegg_id like "cpd:CXXXX", "rn:RXXXX", "hsa:123", "ko:K123"
-            core_id = self._sanitize_kegg_id_for_uri(full_kegg_id)
-            if kegg_db_prefix == "genes" and ":" not in full_kegg_id: # if 'hsa' part is missing from prefix for some reason
-                 # Attempt to prepend organism code if available
-                 if self.pathway_organism and not core_id.startswith(self.pathway_organism):
-                      identifier_org_prefix = self.pathway_organism
-                 else: # Try to guess from id format (e.g., ko for KXXXX)
-                      if core_id.startswith("K") and not full_kegg_id.startswith("ko:"):
-                          identifier_org_prefix="orthology"
-                      else: # Default to general 'genes' if cannot determine
-                          identifier_org_prefix = "genes"
-                 uri = f"http://identifiers.org/kegg.{identifier_org_prefix}/{core_id}"
+            
+            # Split if full_kegg_id itself contains multiple space-separated IDs (e.g. "hsa:123 hsa:456")
+            # This can happen if _extract_kegg_ids_from_name_attr wasn't fully utilized upstream for this specific tuple generation
+            individual_ids = full_kegg_id.split()
 
-            elif kegg_db_prefix.startswith("path"): # e.g. path:hsa, path:ko
-                 path_org = kegg_db_prefix.split(":")[-1] if ":" in kegg_db_prefix else self.pathway_organism
-                 uri = f"http://identifiers.org/kegg.pathway/{path_org}{core_id}" # e.g. hsa00010
-            else:
-                 uri = f"http://identifiers.org/kegg.{kegg_db_prefix}/{full_kegg_id}" # Use full ID here for robustness
-            ET.SubElement(bag, "rdf:li", {"rdf:resource": uri})
+            for single_id in individual_ids:
+                core_id = self._sanitize_kegg_id_for_uri(single_id)
+                uri = ""
+
+                if kegg_db_prefix == "compound":
+                    uri = f"http://identifiers.org/kegg.compound/{core_id}"
+                elif kegg_db_prefix == "reaction":
+                    uri = f"http://identifiers.org/kegg.reaction/{core_id}"
+                elif kegg_db_prefix == "genes": # e.g., hsa:123, eco:b0001
+                    # The full_kegg_id here should be like "hsa:123"
+                    # identifiers.org format is kegg.genes/<org_code>:<gene_id> or kegg.genes/<entry>
+                    # However, KEGG API links often use kegg.genes/ko:Knumber or kegg.genes/hsa:123
+                    # Let's assume single_id is like "hsa:123" or "eco:b0001"
+                    uri = f"http://identifiers.org/kegg.genes/{single_id}"
+                elif kegg_db_prefix == "orthology": # e.g., ko:K12345
+                    uri = f"http://identifiers.org/kegg.orthology/{core_id}" # core_id would be K12345
+                elif kegg_db_prefix.startswith("path"): # e.g. path:hsa, path:ko. full_kegg_id = "path:hsa00010"
+                    # The core_id will be e.g., "hsa00010" or "ko00010"
+                    uri = f"http://identifiers.org/kegg.pathway/{core_id}"
+                else: # Fallback for unknown or less common types
+                    # Try to construct a generic one if possible, or skip
+                    if ":" in single_id:
+                        db, actual_id = single_id.split(":", 1)
+                        uri = f"http://identifiers.org/kegg.{db}/{actual_id}" # Best guess
+                    else:
+                        # Cannot form a good URI, skip this particular ID
+                        print(f"Warning: Could not form Identifiers.org URI for prefix '{kegg_db_prefix}' and ID '{single_id}' for SBML element '{sbml_element_id}'. Skipping annotation for this ID.")
+                        continue
+                
+                if uri:
+                    ET.SubElement(bag, "rdf:li", {"rdf:resource": uri})
 
 
     def create_sbml_model(self) -> ET.Element:
@@ -299,6 +331,20 @@ class KGMLtoSBMLConverter:
         p_elem = ET.SubElement(html_notes, "p")
         p_elem.text = notes_str
         
+        # Pathway annotation for the model itself
+        model_kegg_ids_tuples = []
+        pathway_kegg_full_id = self.kgml_root.get('name') # e.g. path:hsa00010
+        if pathway_kegg_full_id:
+             # The prefix should represent the database, for pathway it's 'pathway' but it also contains organism info
+             # For identifiers.org, it's kegg.pathway/map00010 or kegg.pathway/hsa00010
+             # The 'kegg_db_prefix' is used to construct identifiers.org/kegg.{prefix}/
+             # So we need to pass the actual ID like "hsa00010" and a prefix like "pathway"
+             # The _sanitize_kegg_id_for_uri will strip 'path:' part.
+            sanitized_path_id = self._sanitize_kegg_id_for_uri(pathway_kegg_full_id) # e.g. hsa00010
+            model_kegg_ids_tuples.append(("pathway", sanitized_path_id)) # Use "pathway" as prefix, pass full "hsa00010"
+        self._create_sbml_annotation(model, self.pathway_sbml_id, model_kegg_ids_tuples)
+
+
         # Compartments
         listOfCompartments = ET.SubElement(model, "listOfCompartments")
         default_comp_id = "default_compartment"
@@ -323,17 +369,19 @@ class KGMLtoSBMLConverter:
             
             # Annotations for species
             kegg_id_tuples_for_annotation = []
-            for kid_full in kegg_ids_full_list:
+            for kid_full in kegg_ids_full_list: # kid_full is e.g. "cpd:C00001", "hsa:123", "ko:K456"
                 db_prefix = "unknown"
                 if kid_full.startswith("cpd:"): db_prefix = "compound"
-                elif kid_full.startswith("ko:"): db_prefix = "orthology"
+                elif kid_full.startswith("gl:"): db_prefix = "glycan" # kegg.glycan
+                elif kid_full.startswith("ko:"): db_prefix = "orthology" # kegg.orthology
                 elif re.match(r"^[a-z]{3,4}:", kid_full): # e.g., hsa:, eco: (KEGG Gene ID)
-                    db_prefix = "genes" # It refers to kegg.genes/<org:xxxx> or kegg.genes/<ko:Kxxxx>
-                                       # identifiers.org uses kegg.genes for hsa:123 etc.
-                                       # and kegg.orthology for ko:K123.
-                                       # The full KEGG ID like "hsa:123" or "ko:K123" is used with these.
-                kegg_id_tuples_for_annotation.append((db_prefix, kid_full))
-            
+                    db_prefix = "genes" # It refers to kegg.genes/<org_id_pair> e.g. kegg.genes/hsa:123
+                
+                if db_prefix != "unknown":
+                    kegg_id_tuples_for_annotation.append((db_prefix, kid_full)) # Pass the full ID "hsa:123"
+                else:
+                    print(f"Warning: Unknown KEGG ID prefix for '{kid_full}' in species '{name}'. Skipping annotation for this ID.")
+
             self._create_sbml_annotation(species_elem, sbml_id, kegg_id_tuples_for_annotation)
 
 
@@ -342,7 +390,7 @@ class KGMLtoSBMLConverter:
         for _, reaction_data in self.reactions.items():
             sbml_id = reaction_data['sbml_id']
             name = reaction_data['name']
-            kegg_reaction_id_full = reaction_data['kegg_id_full']
+            kegg_reaction_id_full = reaction_data['kegg_id_full'] # e.g. rn:R00001
 
             reaction_elem = ET.SubElement(listOfReactions, "reaction", {
                 "id": sbml_id, "name": name, 
@@ -350,7 +398,9 @@ class KGMLtoSBMLConverter:
                 "fast": "false" # Default
             })
             
+            # The full ID like "rn:R12345" is passed, _sanitize_kegg_id_for_uri will extract "R12345" in _create_sbml_annotation
             self._create_sbml_annotation(reaction_elem, sbml_id, [('reaction', kegg_reaction_id_full)])
+
 
             # Reactants
             if reaction_data['substrates']:
@@ -417,7 +467,7 @@ class KGMLtoSBMLConverter:
                 elif forward_term_str: # Only forward part if reverse is empty
                     full_math_str = forward_term_str
                 elif reverse_term_str: # Only reverse part if forward is empty (unusual but possible if no reactants)
-                     full_math_str = f"<apply><minus/><cn>0</cn>{reverse_term_str}</apply>" # 0 - k_r * P
+                     full_math_str = f"<apply><minus/><cn type='real'>0</cn>{reverse_term_str}</apply>" # 0 - k_r * P
 
 
             # For reactions with no reactants and no products (e.g. boundary species exchange)
@@ -432,9 +482,10 @@ class KGMLtoSBMLConverter:
                 math_expr_elem = ET.fromstring(full_math_str)
                 math.append(math_expr_elem)
             except ET.ParseError: # Fallback if string is not valid XML
-                ci_elem = ET.SubElement(math, "ci")
-                ci_elem.text = k_forward_id # Default to just kf if complex math string fails
-                
+                cn_elem = ET.SubElement(math, "cn", type="real") # Default to 0 if math string parsing fails
+                cn_elem.text = "0.0"
+                print(f"Warning: Could not parse MathML string for reaction {sbml_id}: {full_math_str}. Defaulting to rate 0.")
+
         return sbml
 
 
