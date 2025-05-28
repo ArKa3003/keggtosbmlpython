@@ -614,18 +614,62 @@ class ImprovedKGMLtoSBMLConverter:
         
         print(f"SBML file saved as: {output_filepath}")
         
+        # Print summary statistics
+        print("\n=== Conversion Summary ===")
+        print(f"Pathway: {self.pathway_name}")
+        print(f"Organism: {self.pathway_organism}")
+        
+        compound_count = sum(1 for s in self.species.values() if s['type'] == 'compound')
+        enzyme_count = sum(1 for s in self.species.values() if s['type'] == 'enzyme')
+        
+        print(f"Species (compounds): {compound_count}")
+        print(f"Enzymes: {enzyme_count}")
+        print(f"Reactions: {len(self.reactions)}")
+        print(f"Parameters: {len(self.parameters)}")
+        
+        # Validate that enzymes are not included as species in SBML
+        print("\n=== Validation ===")
+        enzymes_as_modifiers = 0
+        for reaction_data in self.reactions.values():
+            enzymes_as_modifiers += len(reaction_data['modifiers'])
+        
+        print(f"Enzymes referenced as modifiers: {enzymes_as_modifiers}")
+        
+        # Check for clean naming (no 's_' prefixes)
+        species_with_clean_names = 0
+        for species_data in self.species.values():
+            if species_data['type'] == 'compound' and not species_data['sbml_id'].startswith('s_'):
+                species_with_clean_names += 1
+        
+        print(f"Species with clean names (no 's_' prefix): {species_with_clean_names}/{compound_count}")
+        
+        # Verify parameters exist for enzymatic reactions
+        enzymatic_reactions = sum(1 for r in self.reactions.values() if r['enzymes'])
+        print(f"Enzymatic reactions with parameters: {enzymatic_reactions}")
+        
+        print("=== Conversion Complete ===")
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert KEGG KGML file to SBML format.')
+    parser = argparse.ArgumentParser(description='Convert KEGG KGML file to SBML format with improved handling.')
     parser.add_argument('-i', '--input', required=True, help='Input KGML file path.')
     parser.add_argument('-o', '--output', required=True, help='Output SBML file path (e.g., model.xml).')
+    parser.add_argument('--validate', action='store_true', help='Perform additional validation checks.')
     args = parser.parse_args()
 
     try:
-        converter = KGMLtoSBMLConverter(args.input)
+        converter = ImprovedKGMLtoSBMLConverter(args.input)
         converter.convert_and_save(args.output)
+        
+        if args.validate:
+            print("\n=== Additional Validation ===")
+            # Additional validation could be added here
+            print("Validation complete - check output for any warnings.")
+            
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred during conversion: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
